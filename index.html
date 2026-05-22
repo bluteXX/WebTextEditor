@@ -1,21 +1,301 @@
 <!DOCTYPE html>
-<html>
-    <head>
-    <meta charset="UTF-8">
-    <title>Full-screen Editor</title>
-    <link rel="stylesheet" href="style.css">
-    </head>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Collaborative Text Editor</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
 
-    <body>
-    <div id="help-box">
-        <strong>Dostępne komendy:</strong><br>
-        <code>//font -c &lt;kolor&gt;</code> + Enter<br>
-        <small>np. //font -c red</small>
-    </div>
+  body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: #1e1e2e;
+    color: #cdd6f4;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
 
-    <textarea id="editor" placeholder="Zacznij pisać tutaj..."></textarea>
-    
-    <script src="parser.js"></script>
-    <script src="Functions.js"></script>
-    </body>
+  header {
+    background: #181825;
+    border-bottom: 1px solid #313244;
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  header h1 { font-size: 16px; font-weight: 600; color: #cba6f7; }
+
+  #status {
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-weight: 500;
+  }
+  #status.connecting { background: #f38ba822; color: #f38ba8; }
+  #status.connected  { background: #a6e3a122; color: #a6e3a1; }
+  #status.disconnected { background: #45475a; color: #6c7086; }
+
+  #seq-display {
+    margin-left: auto;
+    font-size: 11px;
+    color: #6c7086;
+    font-family: monospace;
+  }
+
+  #users-display {
+    font-size: 11px;
+    color: #89b4fa;
+  }
+
+  main {
+    flex: 1;
+    display: flex;
+    gap: 0;
+    overflow: hidden;
+  }
+
+  #editor-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+    gap: 8px;
+  }
+
+  #editor {
+    flex: 1;
+    background: #11111b;
+    color: #cdd6f4;
+    border: 1px solid #313244;
+    border-radius: 8px;
+    padding: 16px;
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    font-size: 14px;
+    line-height: 1.6;
+    resize: none;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  #editor:focus { border-color: #cba6f7; }
+  #editor:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  #log-panel {
+    width: 260px;
+    background: #181825;
+    border-left: 1px solid #313244;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #log-header {
+    padding: 10px 14px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #89b4fa;
+    border-bottom: 1px solid #313244;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  #log {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+    font-family: monospace;
+    font-size: 11px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .log-entry {
+    padding: 3px 6px;
+    border-radius: 4px;
+    line-height: 1.4;
+    word-break: break-all;
+  }
+  .log-entry.sent    { color: #89dceb; background: #89dceb11; }
+  .log-entry.recv    { color: #a6e3a1; background: #a6e3a111; }
+  .log-entry.sys     { color: #f9e2af; background: #f9e2af11; }
+  .log-entry.error   { color: #f38ba8; background: #f38ba811; }
+
+  footer {
+    background: #181825;
+    border-top: 1px solid #313244;
+    padding: 6px 20px;
+    font-size: 11px;
+    color: #6c7086;
+    display: flex;
+    gap: 20px;
+  }
+  footer span { display: flex; align-items: center; gap: 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📝 Collaborative Text Editor</h1>
+  <span id="status" class="connecting">● łączenie…</span>
+  <span id="users-display">–</span>
+  <span id="seq-display">seq: –</span>
+</header>
+
+<main>
+  <div id="editor-wrap">
+    <textarea id="editor" placeholder="Połącz z serwerem…" disabled></textarea>
+  </div>
+  <div id="log-panel">
+    <div id="log-header">📡 Log komunikacji</div>
+    <div id="log"></div>
+  </div>
+</main>
+
+<footer>
+  <span>🔒 Zagrożenie A: mutex na dokumencie</span>
+  <span>📋 Zagrożenie B: mutex na liście klientów</span>
+  <span>📦 Zagrożenie C: WS framing</span>
+  <span>🏛 Zagrożenie D: Single Source of Truth</span>
+</footer>
+
+<script>
+/* ─── Konfiguracja ───────────────────────────────────────────────────────── */
+const WS_URL = 'ws://localhost:5000';
+
+/* ─── Stan lokalny ───────────────────────────────────────────────────────── */
+let ws            = null;
+let localSeq      = 0;      // ostatni seq od serwera
+let ignoreInput   = false;  // blokada przy programatycznej zmianie textarea
+let lastContent   = '';     // kopia dokumentu przy ostatnim zdarzeniu input
+
+/* ─── DOM ────────────────────────────────────────────────────────────────── */
+const editor     = document.getElementById('editor');
+const statusEl   = document.getElementById('status');
+const seqEl      = document.getElementById('seq-display');
+const usersEl    = document.getElementById('users-display');
+const logEl      = document.getElementById('log');
+
+/* ─── Logowanie ──────────────────────────────────────────────────────────── */
+function addLog(cls, text) {
+  const el = document.createElement('div');
+  el.className = 'log-entry ' + cls;
+  el.textContent = text;
+  logEl.appendChild(el);
+  logEl.scrollTop = logEl.scrollHeight;
+  // ogranicz do 200 wpisów
+  while (logEl.children.length > 200) logEl.removeChild(logEl.firstChild);
+}
+
+/* ─── Status połączenia ──────────────────────────────────────────────────── */
+function setStatus(state, text) {
+  statusEl.className = 'status ' + state;
+  statusEl.textContent = '● ' + text;
+}
+
+/* ─── Połączenie WebSocket ───────────────────────────────────────────────── */
+function connect() {
+  setStatus('connecting', 'łączenie…');
+  addLog('sys', '→ Łączę z ' + WS_URL);
+
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    setStatus('connected', 'połączono');
+    editor.disabled = false;
+    addLog('sys', '✓ Połączono z serwerem');
+  };
+
+  ws.onclose = () => {
+    setStatus('disconnected', 'rozłączono');
+    editor.disabled = true;
+    addLog('sys', '✗ Rozłączono — ponawiam za 3s…');
+    setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => {
+    addLog('error', '✗ Błąd WebSocket');
+  };
+
+  /*
+   * Zagrożenie D: Serwer jest Single Source of Truth.
+   * Każda wiadomość zawiera seq (numer sekwencji) oraz pełną treść dokumentu.
+   * Lokalny stan jest ZAWSZE nadpisywany autorytatywnym stanem z serwera.
+   */
+  ws.onmessage = (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+
+    addLog('recv', `← ${msg.type} seq=${msg.seq}`);
+    seqEl.textContent = 'seq: ' + msg.seq;
+    localSeq = msg.seq;
+
+    if (msg.type === 'init' || msg.type === 'update') {
+      /*
+       * Nadpisz lokalny dokument stanem z serwera.
+       * ignoreInput = true zapobiega wysyłaniu "echa" z powrotem.
+       * Zachowujemy pozycję kursora tam gdzie to możliwe.
+       */
+      ignoreInput = true;
+      const selStart = editor.selectionStart;
+      const selEnd   = editor.selectionEnd;
+      const prevLen  = editor.value.length;
+
+      editor.value = msg.content;
+      lastContent  = msg.content;
+
+      // Dostosuj pozycję kursora po zmianie długości dokumentu
+      if (msg.type === 'update') {
+        const delta = msg.content.length - prevLen;
+        editor.selectionStart = Math.max(0, selStart + (selStart >= msg.pos ? delta : 0));
+        editor.selectionEnd   = Math.max(0, selEnd   + (selEnd   >= msg.pos ? delta : 0));
+      }
+      ignoreInput = false;
+    }
+  };
+}
+
+/* ─── Wykrywanie zmian i wysyłanie operacji ──────────────────────────────── */
+
+/*
+ * Zagrożenie C (strona klienta): wysyłamy operację edycji jako JSON.
+ * Serwer oczekuje tekstu zakończonego '\n' jako delimiter ramki na poziomie
+ * protokołu TCP — WebSocket sam w sobie ramkuje wiadomości, więc od strony
+ * JS korzystamy ze standardowego ws.send(). Serwer obsługuje ramki WS.
+ *
+ * Zagrożenie D: wysyłamy INTENCJĘ (pos, del, ins) a nie pełny dokument.
+ * Serwer zastosuje ją na swoim buforze i odeśle autorytatywny stan.
+ */
+editor.addEventListener('input', () => {
+  if (ignoreInput || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  const newVal = editor.value;
+  const oldVal = lastContent;
+
+  /* Prosty diff: znajdź pierwszą różnicę od lewej i od prawej */
+  let start = 0;
+  while (start < oldVal.length && start < newVal.length && oldVal[start] === newVal[start])
+    start++;
+
+  let oldEnd = oldVal.length;
+  let newEnd = newVal.length;
+  while (oldEnd > start && newEnd > start && oldVal[oldEnd - 1] === newVal[newEnd - 1]) {
+    oldEnd--; newEnd--;
+  }
+
+  const deleted  = oldEnd - start;          // liczba usuniętych znaków
+  const inserted = newVal.slice(start, newEnd); // wstawiony tekst
+
+  lastContent = newVal;
+
+  const op = { type: 'edit', pos: start, del: deleted, ins: inserted };
+  addLog('sent', `→ edit pos=${start} del=${deleted} ins="${inserted.slice(0,20)}"`);
+  ws.send(JSON.stringify(op));
+});
+
+/* ─── Start ──────────────────────────────────────────────────────────────── */
+connect();
+</script>
+</body>
 </html>
